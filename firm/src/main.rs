@@ -1,20 +1,35 @@
-use std::{time::Duration, str::FromStr, net::Ipv4Addr};
+use std::{time::Duration, str::FromStr, net::Ipv4Addr, thread::{JoinHandle, self}, sync::{Arc, Mutex}, f32::consts::E, cell::RefCell, io::BufWriter};
 
-use embedded_svc::{wifi::{AuthMethod, ClientConfiguration, Configuration, AccessPointConfiguration, Protocol, Wifi}, ipv4};
+use embedded_svc::{wifi::{AuthMethod, ClientConfiguration, Configuration, AccessPointConfiguration, Protocol, Wifi}, ipv4, http::Method, io::Write};
 
-use esp_idf_svc::{hal::{peripherals::Peripherals, adc::{AdcDriver, attenuation, AdcChannelDriver, config::Config}, timer, delay::{NON_BLOCK, self, BLOCK}, gpio::{Pull, PinDriver}}, eventloop::EspSystemEventLoop, wifi::{BlockingWifi, EspWifi, WifiDeviceId, WifiDriver, WifiEvent}, netif::{EspNetif, NetifStack, NetifConfiguration, IpEvent}};
+use esp_idf_svc::{hal::{peripherals::Peripherals, adc::{AdcDriver, attenuation, AdcChannelDriver, config::Config}, timer, delay::{NON_BLOCK, self, BLOCK}, gpio::{Pull, PinDriver}, modem::WifiModemPeripheral, task::{thread::ThreadSpawnConfiguration, block_on}, cpu::Core}, eventloop::EspSystemEventLoop, wifi::{BlockingWifi, EspWifi, WifiDeviceId, WifiDriver, WifiEvent}, netif::{EspNetif, NetifStack, NetifConfiguration, IpEvent}, http::client::EspHttpConnection};
 use esp_idf_svc::hal::delay::TickType;
 use esp_idf_svc::hal::task::queue::Queue;
 use esp_idf_svc::nvs::*;
 
-use log::{info, debug};
+use log::{info, debug, error};
 
-static mut ESPTOUCH_KEY: [u8; 16] = [0; 16];
+#[derive(Debug, Clone)]
+struct MeasurementConfig {
+    pub upload_interval_seconds: u32,
+    pub upload_deploy_id: std::string::String,
+    pub upload_device_id: std::string::String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MeasuredData {
+    pub current_arms: f32,
+    pub power_w: f32,
+    pub freq_hz: f32,
+}
+
+static MEASUREMENT_CONFIG: Mutex<RefCell<Option<MeasurementConfig>>> = Mutex::new(RefCell::new(None));
 
 #[derive(Debug, Clone, Copy)]
 struct SmartConfigResult([u8; 32], [u8; 64], Option<[u8; 6]>);
 
 static mut SMART_CONFIG_QUEUE: Option<Queue<SmartConfigResult>> = None;
+static mut MEASURED_DATA_QUEUE: Option<Queue<MeasuredData>> = None;
 
 /**
  * @brief      SmartConfig event handler
@@ -78,6 +93,147 @@ pub unsafe extern "C" fn sc_event_handler(arg: *mut core::ffi::c_void, event_bas
     }
 }
 
+fn run_wifi_task<M: WifiModemPeripheral + 'static>(modem: M, nvs: EspNvsPartition<NvsDefault>, sys_loop: EspSystemEventLoop, setup_mode: bool) -> (JoinHandle<()>, [u8; 6]) {
+    unsafe {
+        SMART_CONFIG_QUEUE = Some(Queue::new(1));
+    }
+    let measured_data_queue = unsafe {
+        MEASURED_DATA_QUEUE = Some(Queue::new(60));
+        MEASURED_DATA_QUEUE.as_ref().unwrap()
+    };
+    let delay = delay::Delay::new_default();
+    let wifi = WifiDriver::new(modem, sys_loop.clone(), Some(nvs.clone())).unwrap();
+    let wifi_ap_mac = wifi.get_mac(WifiDeviceId::Ap).unwrap();
+    let handle = std::thread::Builder::new().name("WiFi".into()).stack_size(20480).spawn(move || {
+        // Initialize WiFi STA.
+        let wifi = EspWifi::wrap(wifi).unwrap();
+        let mut wifi = BlockingWifi::wrap(
+            wifi,
+            sys_loop.clone(),
+        ).unwrap();
+        // Conifgure SmartConfig event handler.
+        unsafe {
+            esp_idf_svc::sys::esp_event_handler_register(
+                esp_idf_svc::sys::SC_EVENT,
+                esp_idf_svc::sys::ESP_EVENT_ANY_ID,
+                Some(sc_event_handler),
+                core::ptr::null_mut(),
+            );
+        }
+
+        let mut closure = || -> anyhow::Result<()> {
+            wifi.start()?;
+        
+            if setup_mode {
+                // Setup mode
+                info!("Starting setup mode");
+                let err = unsafe { esp_idf_svc::sys::esp_smartconfig_set_type(esp_idf_svc::sys::smartconfig_type_t_SC_TYPE_ESPTOUCH) };
+                if err != esp_idf_svc::sys::ESP_OK {
+                    panic!("Failed to set SmartConfig type: {:?}", err);
+                }
+        
+                // Set to STA mode
+                wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+                    ssid: "".into(),
+                    password: "".into(),
+                    bssid: None,
+                    auth_method: AuthMethod::WPA2WPA3Personal,
+                    channel: None,
+                }))?;
+        
+                let config = esp_idf_svc::sys::smartconfig_start_config_t {
+                    enable_log: true,
+                    esp_touch_v2_enable_crypt: false,
+                    esp_touch_v2_key: core::ptr::null_mut(),
+                };
+                let err = unsafe { esp_idf_svc::sys::esp_smartconfig_start(&config) };
+                if err != esp_idf_svc::sys::ESP_OK {
+                    panic!("Failed to start SmartConfig: {:?}", err);
+                }
+                info!("Setup mode started");
+                let (_config, _) = unsafe { SMART_CONFIG_QUEUE.as_ref().unwrap().recv_front(BLOCK).unwrap() };
+                unsafe { esp_idf_svc::sys::esp_smartconfig_stop() };
+                    
+            } else {
+                let mut wifi_configuration = wifi.get_configuration()?;
+                info!("Using saved WiFi configuration: {:?}", wifi_configuration);
+            }
+
+            let mut client = embedded_svc::http::client::Client::wrap(EspHttpConnection::new(&esp_idf_svc::http::client::Configuration {
+                buffer_size: Some(4096),
+                buffer_size_tx: Some(4096),
+                timeout: Some(Duration::from_secs(5)),
+                crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+                 ..Default::default()
+            })?);
+            let headers = [("accept", "text/plain")];
+            loop {
+                info!("Connecting to WiFi");
+                wifi.connect()?;
+                info!("Connected to WiFi");
+                wifi.wait_netif_up()?;
+                
+                // Discard any pending data
+                while let Some(_) = measured_data_queue.recv_front(NON_BLOCK) {}
+                // Post measured data while connection is active.
+                while wifi.is_connected()? {
+                    if let Some((data, _)) = measured_data_queue.recv_front(TickType::from(Duration::from_millis(1000)).ticks()) {
+                        let post_string = if let Ok(config) = MEASUREMENT_CONFIG.lock() {
+                            let config = config.borrow();
+                            let config = config.as_ref().unwrap();
+                            let deploy_id = &config.upload_deploy_id;
+                            let device_id = &config.upload_device_id;
+                            let power_w = if 45.0f32 <= data.freq_hz && data.freq_hz <= 65.0f32 {
+                                data.power_w
+                            } else {
+                                0.0f32
+                            };
+                            let post_string = format!("https://script.google.com/macros/s/{}/exec?UniqueID={}&current_raw={}&power_raw={}&power={}&frequency={}", deploy_id, device_id, data.current_arms, data.power_w, power_w, data.freq_hz);
+                            Some(post_string)
+                        } else {
+                            None
+                        };
+
+                        if let Some(post_string) = post_string {
+                            info!("GET: {}", &post_string);
+                            const MAX_TRIALS: usize = 3;
+                            for trial in 0..MAX_TRIALS {
+                                let result = client.request(Method::Get, &post_string, &headers)
+                                    .and_then(|request| {
+                                        match request.submit() {
+                                            Ok(response) => {
+                                                info!("Response: status={}", response.status());
+                                                Ok(())
+                                            },
+                                            Err(e) => {
+                                                error!("Failed to post measured data: {:?}", e);
+                                                Err(e)
+                                            },
+                                        }
+                                    });
+                                if let Ok(_) = result {
+                                    break;
+                                } else {
+                                    info!("Retrying in 1 second ({}/{})", trial+1, MAX_TRIALS);
+                                    delay.delay_ms(1000);
+                                }
+                            }
+                        }
+                    }    
+                }
+            }
+        }; 
+        loop {
+            closure().unwrap_or_else(|e| {
+                error!("Error: {:?}", e);
+                info!("Restarting WiFi task");
+            });
+            delay.delay_ms(1000);
+        }
+    }).unwrap();
+    (handle, wifi_ap_mac)
+}
+
 fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -100,105 +256,173 @@ fn main() -> anyhow::Result<()> {
     let mut button = PinDriver::input(peripherals.pins.gpio41)?;
     button.set_pull(Pull::Up)?;
 
-    let nvs_default_partition: EspNvsPartition<NvsDefault> = EspDefaultNvsPartition::take()?;
-    let mut wifi_nvs = match EspNvs::new(nvs_default_partition.clone(), "wifi", true) {
-        Ok(wifi_nvs) => {
-            info!("Got namespace {:?} from default partition", "wifi");
-            wifi_nvs
-        }
-        Err(e) => panic!("Could't get namespace {:?}", e),
-    };
+    static mut NVS_DEFAULT_PARTITION: Option<EspDefaultNvsPartition> = None;
+    unsafe { NVS_DEFAULT_PARTITION = Some(EspDefaultNvsPartition::take()?); }
+    let nvs_default_partition = unsafe { NVS_DEFAULT_PARTITION.as_ref().unwrap() };
 
     let sys_loop = EspSystemEventLoop::take()?;
-    let wifi = WifiDriver::new(peripherals.modem, sys_loop.clone(), Some(nvs_default_partition.clone()))?;
-    let wifi_ap_mac = wifi.get_mac(WifiDeviceId::Ap)?;
-    
-    // Conifgure SmartConfig event handler.
-    unsafe {
-        esp_idf_svc::sys::esp_event_handler_register(
-            esp_idf_svc::sys::SC_EVENT,
-            esp_idf_svc::sys::ESP_EVENT_ANY_ID,
-            Some(sc_event_handler),
-            core::ptr::null_mut(),
-        );
-    }
-
-    // Initialize WiFi STA.
-    let wifi = EspWifi::wrap(wifi)?;
-    let mut wifi = BlockingWifi::wrap(
-        wifi,
-        sys_loop.clone(),
-    )?;
-    wifi.start()?;
-
-    if button.is_low() {
-        // Setup mode
-        info!("Starting setup mode");
-        let err = unsafe { esp_idf_svc::sys::esp_smartconfig_set_type(esp_idf_svc::sys::smartconfig_type_t_SC_TYPE_ESPTOUCH) };
-        if err != esp_idf_svc::sys::ESP_OK {
-            panic!("Failed to set SmartConfig type: {:?}", err);
+    let mut measure_nvs = match EspNvs::new(nvs_default_partition.clone(), "measure", false) {
+        Ok(measure_nvs) => {
+            info!("Got namespace {:?} from default partition", "measure");
+            Some(measure_nvs)
         }
-
-        // Set to STA mode
-        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: "".into(),
-            password: "".into(),
-            bssid: None,
-            auth_method: AuthMethod::WPA2WPA3Personal,
-            channel: None,
-        }))?;
-
-        unsafe {
-            SMART_CONFIG_QUEUE = Some(Queue::new(1));
-            // copy "powermeter" into ESPTOUCH_KEY
-            ESPTOUCH_KEY[0..11].copy_from_slice(b"powermeter\0");
-        }
-        let config = esp_idf_svc::sys::smartconfig_start_config_t {
-            enable_log: true,
-            esp_touch_v2_enable_crypt: false,
-            esp_touch_v2_key: core::ptr::null_mut(),
+        Err(e) => {
+            error!("Could't get namespace {:?}", e);
+            None
+        },
+    };
+    // Initialize configuration
+    let measurement_config = measure_nvs.map(|measure_nvs|{
+        let mut upload_deploy_id_buffer = std::vec::Vec::new();
+        upload_deploy_id_buffer.resize(128, 0);
+        let mut upload_device_id_buffer = std::vec::Vec::new();
+        upload_device_id_buffer.resize(128, 0);
+        let mut config = MeasurementConfig {
+            upload_interval_seconds: measure_nvs.get_u32("u_interval").ok().flatten().unwrap_or(60),
+            upload_deploy_id: measure_nvs.get_str("u_deploy_id", &mut upload_deploy_id_buffer).ok().flatten().unwrap_or("").trim_end_matches(|c| c == '\0').into(),
+            upload_device_id: measure_nvs.get_str("u_device_id", &mut upload_device_id_buffer).ok().flatten().unwrap_or("powermeter").trim_end_matches(|c| c == '\0').into(),
         };
-        let err = unsafe { esp_idf_svc::sys::esp_smartconfig_start(&config) };
-        if err != esp_idf_svc::sys::ESP_OK {
-            panic!("Failed to start SmartConfig: {:?}", err);
+        info!("Got config: {:?}", config);
+        config
+    }).unwrap_or_else(|| {
+        info!("Using default config");
+        MeasurementConfig {
+            upload_interval_seconds: 60,
+            upload_deploy_id: String::from(""),
+            upload_device_id: String::from("powermeter"),
         }
-        info!("Setup mode started");
-        let (_config, _) = unsafe { SMART_CONFIG_QUEUE.as_ref().unwrap().recv_front(BLOCK).unwrap() };
-        unsafe { esp_idf_svc::sys::esp_smartconfig_stop() };
-             
-    } else {
-        let mut wifi_configuration = wifi.get_configuration()?;
-        info!("Got WiFi configuration: {:?}", wifi_configuration);
-    }
-    info!("Connecting to WiFi");
-    wifi.connect().unwrap();
-    info!("Connected to WiFi");
-    wifi.wait_netif_up().unwrap();
+    });
+    MEASUREMENT_CONFIG.lock().unwrap().replace(Some(measurement_config));
 
-    // Initialize Timer
-    let timer_config = timer::config::Config::new().auto_reload(true).divider(80);
-    let mut timer = timer::TimerDriver::new(peripherals.timer00, &timer_config)?;
-    timer.set_alarm(timer.tick_hz() / (SAMPLES_PER_SECOND as u64))?;
+    // Run WiFi task
+    let (_wifi_task, wifi_mac) = run_wifi_task(peripherals.modem, nvs_default_partition.clone(), sys_loop.clone(), button.is_low());
+    let measured_data_queue = unsafe { MEASURED_DATA_QUEUE.as_ref().unwrap() };
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // mDNS
+    let mut mdns = esp_idf_svc::mdns::EspMdns::take()?;
+    mdns.set_hostname("powermeter")?;
+    mdns.set_instance_name(format!("powermeter-{:02X}{:02X}{:02X}", wifi_mac[3], wifi_mac[4], wifi_mac[5]))?;
+    mdns.add_service(None, "_http", "_tcp", 80, &[])?;
+
+    // Run HTTP server
+    let _server = {
+        let nvs = nvs_default_partition.clone();
+
+        let mut server = esp_idf_svc::http::server::EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
+            http_port: 80,
+            max_uri_handlers: 4,
+            ..Default::default()
+        })?;
+        server.fn_handler("/", Method::Get, |request| {
+            request.into_ok_response()?
+                .write_all("PowerMeter configuration server.".as_bytes())?;
+            Ok(())
+        })?;
+        server.fn_handler("/config", Method::Get, |request| {
+            let body = {
+                let guard = MEASUREMENT_CONFIG.lock()?;
+                let config = guard.borrow();
+                let config = config.as_ref().unwrap();
+                format!(include_str!("config.html"), config.upload_interval_seconds, config.upload_deploy_id, config.upload_device_id)
+            };
+            request.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
+                .write_all(body.as_bytes())?;
+            Ok(())
+        })?;
+        server.fn_handler("/config", Method::Post, |mut request| {
+            let mut config = MEASUREMENT_CONFIG.lock()?.borrow().as_ref().unwrap().clone();
+            let mut body = Vec::new();
+            body.resize(1024, 0);
+            let mut bytes_read = 0;
+            while let Ok(bytes) = request.read(&mut body[bytes_read..]) {
+                if bytes < body.len() - bytes_read {
+                    bytes_read += bytes;
+                    body.resize(bytes_read, 0);
+                    break;
+                }
+                bytes_read += bytes;
+                body.resize(bytes_read + 1024, 0)
+            }
+            for (key, value) in url::form_urlencoded::parse(&body) {
+                let key = match &key {
+                    std::borrow::Cow::Borrowed(key) => key,
+                    std::borrow::Cow::Owned(key) => key.as_str(),
+                };
+                match key {
+                    "upload_interval" => {
+                        if let Ok(upload_interval_seconds) = u32::from_str(&value) {
+                            config.upload_interval_seconds = upload_interval_seconds;
+                        }
+                    },
+                    "upload_deploy_id" => {
+                        config.upload_deploy_id = value.into_owned();
+                    },
+                    "upload_device_id" => {
+                        config.upload_device_id = value.into_owned();
+                    },
+                    _ => {
+                        info!("Unknown key: {}", key);
+                    },
+                }
+            }
+            info!("New config: {:?}", config);
+            MEASUREMENT_CONFIG.lock()?.replace(Some(config.clone()));
+            match EspNvs::new(nvs_default_partition.clone(), "measure", true) {
+                Ok(mut measure_nvs) => {
+                    info!("Got namespace {:?} from default partition", "wifi");
+                    measure_nvs.set_u32("u_interval", config.upload_interval_seconds)?;
+                    measure_nvs.set_str("u_deploy_id", &config.upload_deploy_id)?;
+                    measure_nvs.set_str("u_device_id", &config.upload_device_id)?;
+                }
+                Err(e) => panic!("Could't get namespace {:?}", e),
+            };
+            let body = format!(include_str!("config.html"), config.upload_interval_seconds, config.upload_deploy_id, config.upload_device_id);
+            request.into_response(200, Some("OK"), &[("Content-Type", "text/html")])?
+                .write_all(body.as_bytes())?;
+            Ok(())
+        })?;
+        server
+    };
 
     // Initialize Queue
     static mut ADC_QUEUE: Option<Queue<i16>> = None;
     unsafe {
         ADC_QUEUE = Some(Queue::new(SAMPLES_PER_SECOND/5));
     }
-    unsafe {
-        timer.subscribe(move || {
-            let value = adc.read(&mut adc_pin).unwrap() as i16;
-            if let Some(queue) = &ADC_QUEUE {
-                queue.send_back(value, TickType::new(NON_BLOCK).ticks()).ok();
-            }
-        })?;
+
+    
+    // Spawn ADC sampling task
+    ThreadSpawnConfiguration {
+        name: Some(b"ADC\0"),
+        stack_size: 8192,
+        priority: 23,                   // ADC sampling is the highest priority task
+        pin_to_core: Some(Core::Core1), // Run on core 1 to avoid jitter caused by WiFi interrupt.
+        ..Default::default()
     }
+    .set()
+    .unwrap();
+    let _adc_thread = std::thread::Builder::new().spawn(move || {
+        || -> anyhow::Result<()> {
+            // Initialize Timer
+            let timer_config = timer::config::Config::new().auto_reload(true).divider(80);
+            let mut timer = timer::TimerDriver::new(peripherals.timer00, &timer_config)?;
+            timer.set_alarm(timer.tick_hz() / (SAMPLES_PER_SECOND as u64))?;
+            timer.enable_interrupt()?;
+            timer.enable_alarm(true)?;
+            timer.enable(true)?;
 
-    timer.enable_interrupt()?;
-    timer.enable_alarm(true)?;
-    timer.enable(true)?;
-
-    log::info!("Hello, world!");
+            loop {
+                block_on(timer.wait());
+                timer.reset_wait();
+                let value = adc.read(&mut adc_pin).unwrap() as i16;
+                if let Some(queue) = unsafe{ &ADC_QUEUE } {
+                    queue.send_back(value, TickType::new(NON_BLOCK).ticks()).ok();
+                }
+            }
+        }().unwrap();
+    });
 
     let mut number_of_samples = 0;
     let mut accumulated_squared = 0u64;
@@ -219,6 +443,9 @@ fn main() -> anyhow::Result<()> {
     let mut zero_cross_accumulator = 0;
     let mut last_is_positive = None;
 
+    let mut measurement_counter = 0;
+    let mut measured_data: MeasuredData = Default::default();
+
     loop {
         if let Some((adc_voltage_mv, _)) = queue.recv_front(TickType::from(Duration::from_millis(1000)).ticks()) {
             let offset_centered_mv = adc_voltage_mv - OFFSET_MV;
@@ -235,7 +462,7 @@ fn main() -> anyhow::Result<()> {
             let offset_centered_mv = offset_centered_mv as i32;
 
             // Offset detection
-            offset_average_accumulator += offset_centered_mv;
+            offset_average_accumulator += adc_voltage_mv as i32;
             offset_mv = if !offset_average_queue.is_full() {
                 offset_average_queue.enqueue(adc_voltage_mv).ok();
                 OFFSET_MV
@@ -268,12 +495,29 @@ fn main() -> anyhow::Result<()> {
                 let rms_v = mean_squared_mv.sqrt() * 1.0e-3f32;   
                 let current_arms = rms_v*(3000.0f32*1.0e-2f32);
                 let power_w = current_arms * 100.0f32;
-                log::info!("offset: {}, RMS: {}, current: {}, power: {}, freq: {}", offset_mv, rms_v, current_arms, power_w, average_zero_cross_interval.unwrap_or_default());
+                let freq_hz = average_zero_cross_interval.unwrap_or_default();
+                log::info!("offset: {}, RMS: {}, current: {}, power: {}, freq: {}", offset_mv, rms_v, current_arms, power_w, freq_hz);
                 
                 number_of_samples = 0;
                 accumulated_squared = 0;
                 zero_cross_accumulator = 0;
                 zero_cross_count = 0;
+
+                measured_data.current_arms += current_arms;
+                measured_data.power_w += power_w;
+                measured_data.freq_hz += freq_hz;
+                measurement_counter += 1;
+                let upload_interval_seconds = MEASUREMENT_CONFIG.lock().ok().map(|guard| guard.borrow().as_ref().unwrap().upload_interval_seconds);
+                if let Some(upload_interval_seconds) = upload_interval_seconds {
+                    if  measurement_counter >= upload_interval_seconds {
+                        measured_data.current_arms /= measurement_counter as f32;
+                        measured_data.power_w /= measurement_counter as f32;
+                        measured_data.freq_hz /= measurement_counter as f32;
+                        measured_data_queue.send_back(measured_data, TickType::new(NON_BLOCK).ticks()).ok();
+                        measurement_counter = 0;
+                        measured_data = Default::default();
+                    }
+                }
             }
         }
     }

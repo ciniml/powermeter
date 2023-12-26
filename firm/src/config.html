@@ -1,0 +1,32 @@
+<html>
+  <head>
+    <title>Power Meter</title>
+  </head>
+  <body>
+    <h1>Power Meter</h1>
+    <form id="powerMeterForm" action="/config" method="post">
+      <label for="upload_interval">Upload Interval (seconds):</label>
+      <input type="number" id="upload_interval" name="upload_interval" value="{}"><br>
+      <label for="upload_deploy_id">Upload Deploy ID:</label>
+      <input type="text" id="upload_deploy_id" name="upload_deploy_id" value="{}"><br>
+      <label for="upload_device_id">Upload Device ID:</label>
+      <input type="text" id="upload_device_id" name="upload_device_id" value="{}"><br>
+      <input type="button" value="Submit" onclick="submitForm()">
+    </form>
+
+    <script>
+      function submitForm() {{
+        var form = document.getElementById('powerMeterForm');
+        console.log('Uploading Interval:', form.upload_interval.value);
+        console.log('Deploy ID:', form.upload_deploy_id.value);
+        console.log('Device ID:', form.upload_device_id.value);
+
+        // Example AJAX request (uncomment and modify as needed)
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", "/config", true);
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        xhr.send("upload_interval=" + form.upload_interval.value + "&upload_deploy_id=" + form.upload_deploy_id.value + "&upload_device_id=" + form.upload_device_id.value);
+      }}
+    </script>
+  </body>
+</html>
